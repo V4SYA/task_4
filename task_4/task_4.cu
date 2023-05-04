@@ -4,191 +4,151 @@
 Затем выделяется память на хосте и девайсе для двух массивов A и Anew,
 которые хранят значения температуры на сетке.*/
 
-/*В основном цикле while выполняются итерации решения уравнения до тех пор,
-пока ошибка не станет меньше заданной точности или число итераций не достигнет максимального значения.
-    * Увеличивается счетчик итераций iter_host.
-    * Если iter_host кратно 150 или равно 1, то вычисляется ошибка error_host, используя функцию heatError,
-         и уменьшается размер ошибки, используя функцию errorReduce.
-    * Затем текущее значение ошибки error_host копируется с устройства на хост.
-    * Если iter_host кратно 150 или равно 1, то текущее значение ошибки выводится на экран.
-    * Выполняется функция heat для обновления значений матрицы d_Anew.
-    * Указатели d_A и d_Anew меняются местами.
-    * Цикл повторяется до тех пор, пока ошибка error_host не станет меньше заданного порогового значения tol
-         или пока не будет достигнуто максимальное число итераций iter_max.
+/*Основной цикл while выполняет итерации метода Якоби до тех пор,
+   пока не будет достигнута максимальная допустимая ошибка или количество итераций не превысит заданный предел. 
+   В каждой итерации происходит вызов функции cross_calc, которая вычисляет новые значения элементов 
+   массива Anew на основе значений элементов массива A. После каждой 100-й итерации происходит 
+   вызов функции get_error_matrix, которая вычисляет матрицу ошибок между массивами A и Anew, 
+   а затем используется библиотека CUB для нахождения максимальной ошибки. Если максимальная ошибка 
+   меньше заданного порога, то цикл while завершается.
 */
 
-#include <cstdlib>
-#include <cstdio>
-#include <malloc.h>
+#include <mpi.h>
+#include <iostream>
+#include <cmath>
+#include <cstring>
+#include <time.h>
 
-////////////////////////////////////////////////////////////////////////////////
-//Определяет индексы элементов матрицы, для которых нужно выполнить обновление,
-//и вычисляет новые значения элементов на основе значений соседних элементов.
-////////////////////////////////////////////////////////////////////////////////
-#define max(x, y) ((x) > (y) ? (x) : (y))
-__global__ void heat(const double* A, double* Anew, int size) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i > 0 && i < size + 1 && j > 0 && j < size + 1) {
-        Anew[i * (size + 2) + j] = 0.25 * (A[(i + 1) * (size + 2) + j]
-            + A[(i - 1) * (size + 2) + j]
-            + A[i * (size + 2) + j - 1]
-            + A[i * (size + 2) + j + 1]);
+#include <nvtx3/nvToolsExt.h>
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+
+#define BILLION 1000000000
+
+double CORNER_1 = 10;
+double CORNER_2 = 20;
+double CORNER_3 = 30;
+double CORNER_4 = 20;
+
+///////////////////////////////////////////////////
+///вычисление новых значений элементов двумерного 
+///массива Anew на основе значений элементов исходного
+///массива A и заданного шаблона вычислений
+///////////////////////////////////////////////////
+__global__
+void cross_calc(double* A, double* Anew, size_t n){
+    // get the block and thread indices
+    
+    size_t j = blockIdx.x;
+    size_t i = threadIdx.x;
+    // main computation
+    if (i != 0 && j != 0){
+        Anew[j * n + i] = 0.25 * (
+            A[j * n + i - 1] + 
+            A[j * n + i + 1] + 
+            A[(j + 1) * n + i] + 
+            A[(j - 1) * n + i]
+        );
+    
+    }
+
+}
+
+///////////////////////////////////////////////////
+///вычисление ошибки между элементами двух двумерных массивов A и Anew
+///////////////////////////////////////////////////
+__global__
+void get_error_matrix(double* A, double* Anew, double* out){
+    // get index
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // take the maximum error
+    if (blockIdx.x != 0 && threadIdx.x != 0){
+        out[idx] = std::abs(Anew[idx] - A[idx]);
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-//Определяет индексы элементов матрицы, для которых нужно выполнить обновление,
-//и вычисляет новые значения элементов на основе значений соседних элементов. 
-//Также функция вычисляет ошибку между новым и старым значением элемента и сохраняет ее в одномерном массиве er_1d
-////////////////////////////////////////////////////////////////////////////////
-__global__ void heatError(const double* A, double* Anew, int size, double error, double* er_1d) {
 
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i > 0 && i < size + 1 && j > 0 && j < size + 1) {
-        Anew[i * (size + 2) + j] = 0.25 * (A[(i + 1) * (size + 2) + j]
-            + A[(i - 1) * (size + 2) + j]
-            + A[i * (size + 2) + j - 1]
-            + A[i * (size + 2) + j + 1]);
-        int idx_1d = (j * i) - 1;
-        er_1d[idx_1d] = max(error, Anew[i * (size + 2) + j] - A[i * (size + 2) + j]);
-    }
-}
+int main(int argc, char ** argv){
 
-////////////////////////////////////////////////////////////////////////////////
-//Вычисление максимальной ошибки в массиве er_1d и сохранение ее в массиве er_blocks
-////////////////////////////////////////////////////////////////////////////////
-__global__ void errorReduce(double* er_1d, double* er_blocks, int size) {
-    int tid = threadIdx.x;
-    int gid = blockDim.x * blockIdx.x + threadIdx.x;
-    int gsz = blockDim.x * gridDim.x;
+    struct timespec start, stop;
+    clock_gettime(CLOCK_REALTIME, &start);
 
-    double error = er_1d[0];
+    int n, iter_max;
+    double min_error;
 
-    for (int i = gid; i < size; i += gsz)
-        error = max(error, er_1d[i]);
+    sscanf(argv[1], "%d", &n);
+    sscanf(argv[2], "%d", &iter_max);
+    sscanf(argv[3], "%lf", &min_error);
 
-    extern __shared__ double shArr[];
+    int full_size = n * n;
+    double step = (CORNER_2 - CORNER_1) / (n - 1);
+   
+    // Инициализация массивов
+    auto* A = new double[n * n];
+    auto* Anew = new double[n * n];
 
-    shArr[tid] = error;
-    __syncthreads();
-    for (int sz = blockDim.x / 2; sz > 0; sz /= 2) {
-        if (tid < sz)
-            shArr[tid] = max(shArr[tid + sz], shArr[tid]);
-        __syncthreads();
-    }
-    if (tid == 0)
-        er_blocks[blockIdx.x] = shArr[0];
-}
+    std::memset(A, 0, sizeof(double) * n * n);
 
-////////////////////////////////////////////////////////////////////////////////
-// Основная точка входа
-////////////////////////////////////////////////////////////////////////////////
-int main(int argc, char* argv[]) {
-    int size, iter_max;
-    double tol;
-    
-    tol = strtod(argv[1], NULL);
-    size = atoi(argv[2]);
-    iter_max = atoi(argv[3]);
-
-    double* A = (double*)malloc((size + 2) * (size + 2) * sizeof(double));
-    double* Anew = (double*)malloc((size + 2) * (size + 2) * sizeof(double));
-
-   //Объявление трёхмерного блока потоков с размерами 32x32x1
-    dim3 BS(32, 32, 1);
-    //Объявление трёхмерной сетки блоков потоков с размерами, 
-    //вычисленными по формуле ((size + 2 + 31) / 32) на каждую ось
-    dim3 GS((size + 2 + 31) / 32, (size + 2 + 31) / 32, 1);
-
-    double* d_A, * d_Anew;
-
-    //Выделение памяти на устройстве для массива A размером (size + 2) * (size + 2) 
-    //элементов типа double и привязка указателя d_A к началу выделенной области памяти
-    cudaMalloc((void**)&d_A, sizeof(double) * (size + 2) * (size + 2));
-    //Выделение памяти на устройстве для массива Anew размером (size + 2) * (size + 2)
-    //элементов типа double и привязка указателя d_Anew к началу выделенной области памяти
-    cudaMalloc((void**)&d_Anew, sizeof(double) * (size + 2) * (size + 2));
-
-    int iter_host = 0;
-    double error_host = 1.0;
-    double add_grad_host = 10.0 / (size + 2);
-
-    int len_host = size + 2;
-    //Инициализируем массивы A и Anew, а также заполняем граничные значения
-    for (int i = 0; i < size + 2; i++)
-    {
-        A[i * len_host] = 10 + add_grad_host * i;
-        A[i] = 10 + add_grad_host * i;
-        A[len_host * (size + 1) + i] = 20 + add_grad_host * i;
-        A[len_host * i + size + 1] = 20 + add_grad_host * i;
-
-        Anew[len_host * i] = A[i * len_host];
-        Anew[i] = A[i];
-        Anew[len_host * (size + 1) + i] = A[len_host * (size + 1) + i];
-        Anew[len_host * i + size + 1] = A[len_host * i + size + 1];
+    //Угловые значения
+    A[0] = CORNER_1;
+    A[n - 1] = CORNER_2;
+    A[n * n - 1] = CORNER_3;
+    A[n * (n - 1)] = CORNER_4;
+   
+    //Значения краёв сетки
+    for (int i = 1; i < n - 1; i ++) {
+        A[i] = CORNER_1 + i * step;
+        A[n * i] = CORNER_1 + i * step;
+        A[(n-1) + n * i] = CORNER_2 + i * step;
+        A[n * (n-1) + i] = CORNER_4 + i * step;
     }
 
-    //Копирование данных из массива A в память на устройстве, указатель на которую хранится в d_A
-    cudaMemcpy(d_A, A, sizeof(double) * (size + 2) * (size + 2), cudaMemcpyHostToDevice);
-    //Копирование данных из массива Anew в память на устройстве, указатель на которую хранится в d_Anew
-    cudaMemcpy(d_Anew, Anew, sizeof(double) * (size + 2) * (size + 2), cudaMemcpyHostToDevice);
+    std::memcpy(Anew, A, sizeof(double) * full_size);
 
-    double* d_err_1d;
-    
-    //Выделение памяти на устройстве для массива ошибок размером size * size элементов типа double
-    //и привязка указателя d_err_1d к началу выделенной области памяти
-    cudaMalloc(&d_err_1d, sizeof(double) * (size * size));
-    
-    //Объявление блока потоков для вычисления ошибки размером 1024x1x1
-    dim3 errBS(1024, 1, 1);
-    //Объявление сетки блоков потоков для вычисления ошибки размером,
-    //вычисленным по формуле ceil((size * size) / (float)errBS.x) на каждую ось
-    dim3 errGS(ceil((size * size) / (float)errBS.x), 1, 1);
+    cudaSetDevice(3);
 
-    double* dev_out;
-    //выделение памяти на устройстве для массива результатов вычисления ошибки
-    //размером errGS.x элементов типа double и привязка указателя dev_out
-    //к началу выделенной области памяти
-    cudaMalloc(&dev_out, sizeof(double) * errGS.x);
+    double* dev_A, *dev_B, *dev_err, *dev_err_mat, *temp_stor = NULL;
+    size_t tmp_stor_size = 0;
 
+    int i = 0;
+    double error = 1.0;
 
-    double* d_ptr;
-    //Выделение памяти на устройстве для переменной типа double
-    //и привязка указателя d_ptr к началу выделенной области памяти
-    cudaMalloc((void**)(&d_ptr), sizeof(double));
-    
-    //Cинхронизация потоков на устройстве
-    cudaDeviceSynchronize();
-    while ((error_host > tol) && (iter_host < iter_max)) {
-        iter_host++;
+    nvtxRangePushA("Main loop");
 
-        if ((iter_host % 150 == 0) || (iter_host == 1)) {
-            error_host = 0.0;
-            // Вычисляем разницу между A и Anew
-            heatError << <GS, BS >> > (d_A, d_Anew, size, error_host, d_err_1d);
-            // Уменьшаем размерность массива ошибки до одномерного массива
-            errorReduce << <errGS, errBS, (errBS.x) * sizeof(double) >> > (d_err_1d, dev_out, size * size);
-            errorReduce << <1, errBS, (errBS.x) * sizeof(double) >> > (dev_out, d_err_1d, errGS.x);
-            cudaMemcpy(&error_host, &d_err_1d[0], sizeof(double), cudaMemcpyDeviceToHost);
+    while (i < iter_max && error > min_error){
+        i++;
+        // Вычисление итерации
+        cross_calc<<<n-1, n-1>>>(dev_A, dev_B, n);
+
+        if (i % 100 == 0){
+            // Получение ошибки
+            get_error_matrix<<<n - 1, n - 1>>>(dev_A, dev_B, dev_err_mat);
+            // Найти макс. ошибку
+            cub::DeviceReduce::Max(temp_stor, tmp_stor_size, dev_err_mat, dev_err, full_size);
+            // Копирую память в хост
+            cudaMemcpy(&error, dev_err, sizeof(double), cudaMemcpyDeviceToHost);
+
         }
-        
-        //Вызываем функцию heat для вычисления новых значений Anew
-        else heat << <GS, BS >> > (d_A, d_Anew, size);
-
-        d_ptr = d_A;
-        d_A = d_Anew;
-        d_Anew = d_ptr;
-    
-        //Отслеживаем прогресс вычислений
-        if ((iter_host % 150 == 0) || (iter_host == 1)) {
-            printf("%d : %lf\n", iter_host, error_host);
-            fflush(stdout);
-        }
+       
+        // Смена матриц
+        std::swap(dev_A, dev_B);
     }
-    
-    //Вывод результата
-    printf("%d : %lf\n", iter_host, error_host);
+
+    nvtxRangePop();
+
+    clock_gettime(CLOCK_REALTIME, &stop);
+    double delta = (stop.tv_sec - start.tv_sec) + (double)(stop.tv_nsec - start.tv_nsec)/(double)BILLION;
+
+    std::cout << "Error: " << error << std::endl;
+    std::cout << "Iteration: " << i << std::endl;
+    std::cout << "Time: " << delta << std::endl;
+
+    cudaFree(temp_stor);
+    cudaFree(dev_err_mat);
+    cudaFree(dev_A);
+    cudaFree(dev_B);
+
+    delete[] A;
+    delete[] Anew;
     return 0;
 }
