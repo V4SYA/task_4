@@ -31,17 +31,17 @@ double CORNER_3 = 30;
 double CORNER_4 = 20;
 
 ///////////////////////////////////////////////////
-///вычисление новых значений элементов двумерного 
+///Вычисление новых значений элементов 
 ///массива Anew на основе значений элементов исходного
 ///массива A и заданного шаблона вычислений
 ///////////////////////////////////////////////////
 __global__
 void cross_calc(double* A, double* Anew, size_t n){
-    // get the block and thread indices
+    // Получаю индексы блоков и потоков
     
     size_t j = blockIdx.x;
     size_t i = threadIdx.x;
-    // main computation
+
     if (i != 0 && j != 0){
         Anew[j * n + i] = 0.25 * (
             A[j * n + i - 1] + 
@@ -55,13 +55,13 @@ void cross_calc(double* A, double* Anew, size_t n){
 }
 
 ///////////////////////////////////////////////////
-///вычисление ошибки между элементами двух двумерных массивов A и Anew
+///Вычисление ошибки между элементами двух массивов A и Anew
 ///////////////////////////////////////////////////
 __global__
 void get_error_matrix(double* A, double* Anew, double* out){
-    // get index
+    // Получаю индекс
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // take the maximum error
+    // Получаю макс. ошибку
     if (blockIdx.x != 0 && threadIdx.x != 0){
         out[idx] = std::abs(Anew[idx] - A[idx]);
     }
@@ -130,7 +130,7 @@ int main(int argc, char ** argv){
 
         }
        
-        // Смена матриц
+        // Смена массивов
         std::swap(dev_A, dev_B);
     }
 
