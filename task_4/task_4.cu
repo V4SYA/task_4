@@ -80,7 +80,8 @@ int main(int argc, char *argv[]){
     struct timespec start, stop;
     clock_gettime(CLOCK_REALTIME, &start);    
     double delta, min_error;
-    int m, iter_max;    
+    int m, iter_max;
+	
     // Проверка ввода данных
     if (argc < 4){
         printf("%s\n", ERROR_WITH_ARGS);
