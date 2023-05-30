@@ -39,6 +39,12 @@ double CORNER_2 = 20;
 double CORNER_3 = 30;
 double CORNER_4 = 20;
 
+////////////////////////////////////////////////////////////////
+// Функция fillBorders заполняет границы двумерного массива значениями, 
+// полученными путем линейной интерполяции на основе переданных параметров (top, bottom, left, right). 
+// Функция использует технологию параллельных вычислений на GPU с помощью CUDA и выполняется в блоках и нитях. 
+// Количество нитей в блоке должно быть кратным числу 32 и не превышать 1024.
+////////////////////////////////////////////////////////////////
 __global__ void fillBorders(double *arr, double top, double bottom, double left, double right, int m) {
 
         // Выполняем линейную интерполяцию на границах массива
@@ -51,6 +57,13 @@ __global__ void fillBorders(double *arr, double top, double bottom, double left,
             arr[IDX2F(j,m,m)] = arr[IDX2F(j,2*m,m)] = (arr[IDX2F(1,m,m)] + right*(j-1)); //right
         }
 }
+
+////////////////////////////////////////////////////////////////
+// Вычислям среднее значение элемента массива arr, используя значения элементов, расположенных вокруг него. 
+// Функция принимает на вход указатель на массив arr, индексы p и q,
+// определяющие расстояние между элементами вокруг центрального элемента,
+// и m - размерность массива
+////////////////////////////////////////////////////////////////
 __global__ void getAverage(double *arr, int p, int q, int m) {
 
         // Присваиваем ячейке среднее значение от креста, окружающего её
@@ -58,6 +71,8 @@ __global__ void getAverage(double *arr, int p, int q, int m) {
         int i = blockDim.x * blockIdx.x + threadIdx.x;
         int j = blockDim.y * blockIdx.y + threadIdx.y;
 
+        //Если условие выполнено, то функция вычисляет среднее значение элемента arr[i,j+p], 
+        //используя значения элементов, расположенных вокруг него
         if ((i > 1) && (i < m) && (j > 1) && (j < m)) {
         arr[IDX2F(i,j+p,m)] = 0.25 * (arr[IDX2F(i+1,j+q,m)]
                                         + arr[IDX2F(i-1,j+q,m)]
@@ -65,13 +80,20 @@ __global__ void getAverage(double *arr, int p, int q, int m) {
                                         + arr[IDX2F(i,j+1+q,m)]);
         }
 }
+
+////////////////////////////////////////////////////////////////
+// Вычитаем элементы двух массивов arr_a и arr_b и сохраняет результат в массиве arr_b.
+// Используем макрос IDX2F для вычисления индекса элемента матрицы по его строке и столбцу
+////////////////////////////////////////////////////////////////
 __global__ void subtractArrays(const double *arr_a, double *arr_b, int m) {
 
         int i = blockDim.x * blockIdx.x + threadIdx.x;
         int j = blockDim.y * blockIdx.y + threadIdx.y;
 
+        //Работаем только с элементами, которые расположены внутри матрицы,
+        //то есть не находятся на её границах
         if ((i > 1) && (i < m) && (j > 1) && (j < m)) {
-	    arr_b[IDX2F(i,j,m)] = ABS(arr_a[IDX2F(i,j,m)] - arr_a[IDX2F(i,j+m,m)]);
+	        arr_b[IDX2F(i,j,m)] = ABS(arr_a[IDX2F(i,j,m)] - arr_a[IDX2F(i,j+m,m)]);
         }
 }
 
@@ -81,7 +103,7 @@ int main(int argc, char *argv[]){
     clock_gettime(CLOCK_REALTIME, &start);    
     double delta, min_error;
     int m, iter_max;
-	
+    
     // Проверка ввода данных
     if (argc < 4){
         printf("%s\n", ERROR_WITH_ARGS);
@@ -147,7 +169,7 @@ int main(int argc, char *argv[]){
         exit(1);
     }
     
-    // Это ядро заполняет границы с помощью линейной интерполяции
+    // Это ядро ​​заполняет границы с помощью линейной интерполяции
     fillBorders<<<(m + 1024 - 1)/1024, 1024, 0, stream>>>(d_A, top, bottom, left, right, m);
     cudaErr = cudaMemcpyAsync(arr, d_A, size, cudaMemcpyDeviceToHost, stream);
     if (cudaErr != cudaSuccess) {
@@ -193,34 +215,30 @@ int main(int argc, char *argv[]){
     {
     while(iter < iter_max && flag) {
     	if(!graphCreated) {
-    		// Здесь мы начинаем фиксировать вызовы ядра в графе перед их вызовом.
-                    // Это позволяет нам сократить накладные расходы на звонки
+    		// Здесь мы начинаем фиксировать вызовы ядра в graph перед их вызовом.
+            // Это позволяет нам сократить накладные расходы на вызовы
     		cudaErr = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
     		if (cudaErr != cudaSuccess) {
-           		    fprintf(stderr,
-                        "Failed to start stream capture (error code %s)!\n",
-                        cudaGetErrorString(cudaErr));
+           		    fprintf(stderr, "Failed to start stream capture (error code %s)!\n", cudaGetErrorString(cudaErr));
             	    exit(1);
     		}
     		for (int i = 0; i < 100; i++) {
-                            //q и p выбирают, какой массив мы считаем новым, а какой — старым.
+                //q и p выбирают, какой массив мы считаем новым, а какой — старым.
     			q = (i % 2) * m;
     			p = m - q;
     			getAverage<<<grid, block, 0, stream>>>(d_A, p, q, m);
     		}
+
+            //Отслеживаем статусы
     		cudaErr = cudaStreamEndCapture(stream, &graph);
     		if (cudaErr != cudaSuccess) {
-                        fprintf(stderr,
-                        "Failed to end stream capture (error code %s)!\n",
-                        cudaGetErrorString(cudaErr));
+                        fprintf(stderr, "Failed to end stream capture (error code %s)!\n", cudaGetErrorString(cudaErr));
                         exit(1);
                     }
     		cudaErr = cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
     		if (cudaErr != cudaSuccess) {
-                        fprintf(stderr,
-                        "Failed to instantiate cuda graph (error code %s)!\n",
-                        cudaGetErrorString(cudaErr));
+                        fprintf(stderr, "Failed to instantiate cuda graph (error code %s)!\n", cudaGetErrorString(cudaErr));
                         exit(1);
                     }
     		graphCreated = true;    
@@ -228,15 +246,11 @@ int main(int argc, char *argv[]){
 
     	cudaErr = cudaGraphLaunch(instance, stream);
     	if (cudaErr != cudaSuccess) {
-                fprintf(stderr,
-                "Failed to launch cuda graph (error code %s)!\n",
-                cudaGetErrorString(cudaErr));
+                fprintf(stderr, "Failed to launch cuda graph (error code %s)!\n", cudaGetErrorString(cudaErr));
                 exit(1);
             }
     	if (cudaErr != cudaSuccess) {
-                fprintf(stderr,
-                "Failed to synchronize the stream (error code %s)!\n",
-                cudaGetErrorString(cudaErr));
+                fprintf(stderr, "Failed to synchronize the stream (error code %s)!\n", cudaGetErrorString(cudaErr));
                 exit(1);
             }
 
@@ -250,9 +264,7 @@ int main(int argc, char *argv[]){
     	cudaErr = cudaMemcpyAsync(h_buff, d_buff, sizeof(double), cudaMemcpyDeviceToHost, stream);
 
     	if (cudaErr != cudaSuccess) {
-                fprintf(stderr,
-                "Failed to copy error back to host memory(error code %s)!\n",
-                cudaGetErrorString(cudaErr));
+                fprintf(stderr, "Failed to copy error back to host memory(error code %s)!\n", cudaGetErrorString(cudaErr));
                 exit(1);
             }
     	err = *h_buff;
@@ -269,7 +281,7 @@ int main(int argc, char *argv[]){
     printf("Final result: %d, %0.8lf\n", iter, err);
 
     cudaErr = cudaMemcpy(arr, d_A, size, cudaMemcpyDeviceToHost);
-    
+
     if (m == 13) {
         for (int i = 1; i <= m; i++) {
             for (int j = 1; j <= m; j++) {
