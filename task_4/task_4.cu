@@ -13,14 +13,21 @@
    меньше заданного порога, то цикл while завершается.
 */
 
-#include <iostream>
-#include <cmath>
-#include <cstring>
+#include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
-
-#include <nvtx3/nvToolsExt.h>
+#include <math.h>
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #include <cub/cub.cuh>
+
+#define BILLION 1000000000.0
+
+#define MAX(x, y) (((x)>(y))?(x):(y))
+
+#define ABS(x) ((x)<0 ? -(x): (x))
+
+#define IDX2F(i,j,ld) ((((j)-1)*(ld))+((i)-1))
 
 char ERROR_WITH_ARGS[] = ">>> Not enough args\n";
 char ERROR_WITH_ARG_1[] = ">>> Incorrect first param\n";
@@ -32,209 +39,252 @@ double CORNER_2 = 20;
 double CORNER_3 = 30;
 double CORNER_4 = 20;
 
-///////////////////////////////////////////////////
-///Вычисление новых значений элементов 
-///массива Anew на основе значений элементов исходного
-///массива A и заданного шаблона вычислений
-///////////////////////////////////////////////////
-__global__
-void cross_calc(double* A, double* Anew, size_t size){
-    // get the block and thread indices
-    
-    size_t j = blockIdx.x;
-    size_t i = threadIdx.x;
-    // main cross computation. the average of 4 incident cells is taken
-    if (i != 0 && j != 0){
-       
-        Anew[j * size + i] = 0.25 * (
-            A[j * size + i - 1] + 
-            A[j * size + i + 1] + 
-            A[(j + 1) * size + i] + 
-            A[(j - 1) * size + i]
-        );
-    
-    }
+__global__ void fillBorders(double *arr, double top, double bottom, double left, double right, int m) {
 
+        // Выполняем линейную интерполяцию на границах массива
+        int j = blockDim.x * blockIdx.x + threadIdx.x;
+
+        if ((j > 0) && (j < m)) {
+	    arr[IDX2F(1,j,m)] = arr[IDX2F(1,j+m,m)] = (arr[IDX2F(1,1,m)] + top*(j-1));   //top
+            arr[IDX2F(m,j,m)] = arr[IDX2F(m,j+m,m)]  = (arr[IDX2F(m,1,m)] + bottom*(j-1)); //bottom
+            arr[IDX2F(j,1,m)]  = arr[IDX2F(j,m+1,m)] = (arr[IDX2F(1,1,m)] + left*(j-1)); //left
+            arr[IDX2F(j,m,m)] = arr[IDX2F(j,2*m,m)] = (arr[IDX2F(1,m,m)] + right*(j-1)); //right
+        }
+}
+__global__ void getAverage(double *arr, int p, int q, int m) {
+
+        // Присваиваем ячейке среднее значение от креста, окружающего её
+
+        int i = blockDim.x * blockIdx.x + threadIdx.x;
+        int j = blockDim.y * blockIdx.y + threadIdx.y;
+
+        if ((i > 1) && (i < m) && (j > 1) && (j < m)) {
+        arr[IDX2F(i,j+p,m)] = 0.25 * (arr[IDX2F(i+1,j+q,m)]
+                                        + arr[IDX2F(i-1,j+q,m)]
+                                        + arr[IDX2F(i,j-1+q,m)]
+                                        + arr[IDX2F(i,j+1+q,m)]);
+        }
+}
+__global__ void subtractArrays(const double *arr_a, double *arr_b, int m) {
+
+        int i = blockDim.x * blockIdx.x + threadIdx.x;
+        int j = blockDim.y * blockIdx.y + threadIdx.y;
+
+        if ((i > 1) && (i < m) && (j > 1) && (j < m)) {
+	    arr_b[IDX2F(i,j,m)] = ABS(arr_a[IDX2F(i,j,m)] - arr_a[IDX2F(i,j+m,m)]);
+        }
 }
 
 
-///////////////////////////////////////////////////
-///Вычисление ошибки между элементами двух массивов A и Anew
-///////////////////////////////////////////////////
-__global__
-void get_error_matrix(double* A, double* Anew, double* out){
-    // Получаю индекс
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Получаю макс. ошибку
-    if (blockIdx.x != 0 && threadIdx.x != 0){
-        out[idx] = std::abs(Anew[idx] - A[idx]);
-    }
-
-}
-
-int main(int argc, char ** argv){
-    int max_iter, size;
-    double min_error;
-
+int main(int argc, char *argv[]){
+    struct timespec start, stop;
+    clock_gettime(CLOCK_REALTIME, &start);    
+    double delta, min_error;
+    int m, iter_max;    
     // Проверка ввода данных
     if (argc < 4){
-        std::cout << ERROR_WITH_ARGS << std::endl;
+        printf("%s\n", ERROR_WITH_ARGS);
         exit(1);
     } else{
-        size = atoi(argv[1]); // Размер сетки
-        if (size == 0){
-            std::cout << ERROR_WITH_ARG_1 << std::endl;
+        m = atoi(argv[1]); // Размер сетки
+        if (m == 0){
+            printf("%s\n", ERROR_WITH_ARG_1);
             exit(1);
         }
-        max_iter = atoi(argv[2]); // Количество итераций
-        if (max_iter == 0){
-            std::cout << ERROR_WITH_ARG_2 << std::endl;
+        iter_max = atoi(argv[2]); // Количество итераций
+        if (iter_max == 0){
+            printf("%s\n", ERROR_WITH_ARG_2);
             exit(1);
         }
         min_error = atof(argv[3]); // Точность
         if (min_error == 0){
-            std::cout << ERROR_WITH_ARG_3 << std::endl;
+            printf("%s\n", ERROR_WITH_ARG_3);
             exit(1);
         }
+    }    
+
+    int iter = 0;
+    double err = min_error + 1;
+    size_t size = 2 * m * m * sizeof(double);
+    double *arr = (double*)malloc(size);
+
+    for(int j = 1; j <= m; j++){
+        for(int i = 1; i <= m; i++){
+            arr[IDX2F(i,j,m)] = 0;
+        }
     }
-
-    clock_t a = clock();
-
-    int full_size = size * size;
-    double step = (CORNER_2 - CORNER_1) / (size - 1);
-
-    // Инициализация массивов
-    auto* A = new double[size * size];
-    auto* Anew = new double[size * size];
-
-    std::memset(A, 0, sizeof(double) * size * size);
-
-    // Угловые значения
-    A[0] = CORNER_1;
-    A[size - 1] = CORNER_2;
-    A[size * size - 1] = CORNER_3;
-    A[size * (size - 1)] = CORNER_4;
-
-    // Значения краёв сетки
-    for (int i = 1; i < size - 1; i ++) {
-        A[i] = CORNER_1 + i * step;
-        A[size * i] = CORNER_1 + i * step;
-        A[(size-1) + size * i] = CORNER_2 + i * step;
-        A[size * (size-1) + i] = CORNER_4 + i * step;
-    }
-
-    std::memcpy(Anew, A, sizeof(double) * full_size);
     
-    // Выбор девайса
-    cudaSetDevice(3);
+    arr[IDX2F(1,1,m)] = arr[IDX2F(1,m+1,m)] = CORNER_1;
+    arr[IDX2F(1,m,m)] = arr[IDX2F(1,2*m,m)] = CORNER_2;
+    arr[IDX2F(m,1,m)] = arr[IDX2F(m,m+1,m)] = CORNER_4;
+    arr[IDX2F(m,m,m)] = arr[IDX2F(m,2*m,m)] = CORNER_3;
     
-    double* dev_A, *dev_B, *dev_err, *dev_err_mat, *temp_stor = NULL;
-    size_t tmp_stor_size = 0;
+    // Коэффициенты для линейной интерполяции
+    double top, bottom, left, right;
 
-    // Выделение памяти на 2 матрицы и переменная ошибки на устройстве 
-    cudaError_t status_A = cudaMalloc(&dev_A, sizeof(double) * full_size);
-    cudaError_t status_B = cudaMalloc(&dev_B, sizeof(double) * full_size);
-    cudaError_t status = cudaMalloc(&dev_err, sizeof(double));
+    top = (arr[IDX2F(1,m,m)] - arr[IDX2F(1,1,m)])/(m-1);
+    bottom = (arr[IDX2F(m,m,m)] - arr[IDX2F(m,1,m)])/(m-1);
+    left = (arr[IDX2F(m,1,m)] - arr[IDX2F(1,1,m)])/(m-1);
+    right = (arr[IDX2F(m,m,m)] - arr[IDX2F(1,m,m)])/(m-1);
 
-    // Некоторые действия по выделению памяти для выявления ошибок
-    if (status != cudaSuccess){
-        std::cout << "Device error variable allocation error " << status << std::endl;
-        return status;
+    cudaError_t cudaErr = cudaSuccess;
+    double *d_A = NULL;
+    cudaErr = cudaMalloc((void **)&d_A, size);
+    if (cudaErr != cudaSuccess) {
+        fprintf(stderr, "(error code %s)!\n", cudaGetErrorString(cudaErr));
+        exit(1);
     }
 
-    // Выделение памяти на устройстве для матрицы ошибок
-    status = cudaMalloc(&dev_err_mat, sizeof(double) * full_size);
-    if (status != cudaSuccess){
-        std::cout << "Device error matrix allocation error " << status << std::endl;
-        return status;
+    double *d_B = NULL;
+    cudaErr = cudaMalloc((void **)&d_B, size/2);
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaErr = cudaMemcpyAsync(d_A, arr, size, cudaMemcpyHostToDevice, stream);
+
+    if (cudaErr != cudaSuccess) {
+        fprintf(stderr, "(error code %s)!\n", cudaGetErrorString(cudaErr));
+        exit(1);
     }
-    if (status_A != cudaSuccess){
-        std::cout << "Kernel A allocation error " << status << std::endl;
-        return status;
-    } else if (status_B != cudaSuccess){
-        std::cout << "Kernel B allocation error " << status << std::endl;
-        return status;
+    
+    // Это ядро заполняет границы с помощью линейной интерполяции
+    fillBorders<<<(m + 1024 - 1)/1024, 1024, 0, stream>>>(d_A, top, bottom, left, right, m);
+    cudaErr = cudaMemcpyAsync(arr, d_A, size, cudaMemcpyDeviceToHost, stream);
+    if (cudaErr != cudaSuccess) {
+        fprintf(stderr, "(error code %s)!\n", cudaGetErrorString(cudaErr));
+        exit(1);
     }
 
-    status_A = cudaMemcpy(dev_A, A, sizeof(double) * full_size, cudaMemcpyHostToDevice);
-    if (status_A != cudaSuccess){
-        std::cout << "Kernel A copy to device error " << status << std::endl;
-        return status_A;
-    }
-    status_B = cudaMemcpy(dev_B, Anew, sizeof(double) * full_size, cudaMemcpyHostToDevice);
-    if (status_B != cudaSuccess){
-        std::cout << "kernel B copy to device error " << status << std::endl;
-        return status_B;
-    }
-
-    status = cub::DeviceReduce::Max(temp_stor, tmp_stor_size, dev_err_mat, dev_err, full_size);
-    if (status != cudaSuccess){
-        std::cout << "Max reduction error " << status << std::endl;
-        return status;
+    printf("\n");
+    if (m == 13) {
+        for (int i = 1; i <= m; i++) {
+            for (int j = 1; j <= m; j++) {
+                printf("%06.3lf ", arr[IDX2F(i,j,m)]);
+            }
+            printf("\n");
+        }
     }
 
-    status = cudaMalloc(&temp_stor, tmp_stor_size);
-    if (status != cudaSuccess){
-        std::cout << "Temporary storage allocation error " << status  << std::endl;
-        return status;
-    }
+    int p = m, q = 0, flag = 1;
+    double *h_buff = (double*)malloc(sizeof(double));
+    double *d_buff = NULL;
 
-    int i = 0;
-    double error = 1.0;
+    cudaErr = cudaMalloc((void**)&d_buff, sizeof(double));
+    if (cudaErr != cudaSuccess) {
+        fprintf(stderr, "(error code %s)!\n", cudaGetErrorString(cudaErr));
+        exit(1);
+    }
+    
+    dim3 grid((m + 32 - 1)/32 , (m + 32 - 1)/32);    
+    dim3 block(32, 32);
+
+    void *d_temp_storage = NULL;
+    size_t temp_storage_bytes = 0;
+
+    // Вызываем DeviceReduce здесь, чтобы проверить, сколько памяти нам нужно для временного хранилища
+    cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, d_B, d_buff, m*m, stream);
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+
+    bool graphCreated = false;
+    cudaGraph_t graph;
+    cudaGraphExec_t instance;
 
     nvtxRangePushA("Main loop");
+    {
+    while(iter < iter_max && flag) {
+    	if(!graphCreated) {
+    		// Здесь мы начинаем фиксировать вызовы ядра в графе перед их вызовом.
+                    // Это позволяет нам сократить накладные расходы на звонки
+    		cudaErr = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
-    // Основной алгоритм
-    while (i < max_iter && error > min_error){
-        i++;
-        // Вычисление итерации
-        cross_calc<<<size-1, size-1>>>(dev_A, dev_B, size);
+    		if (cudaErr != cudaSuccess) {
+           		    fprintf(stderr,
+                        "Failed to start stream capture (error code %s)!\n",
+                        cudaGetErrorString(cudaErr));
+            	    exit(1);
+    		}
+    		for (int i = 0; i < 100; i++) {
+                            //q и p выбирают, какой массив мы считаем новым, а какой — старым.
+    			q = (i % 2) * m;
+    			p = m - q;
+    			getAverage<<<grid, block, 0, stream>>>(d_A, p, q, m);
+    		}
+    		cudaErr = cudaStreamEndCapture(stream, &graph);
+    		if (cudaErr != cudaSuccess) {
+                        fprintf(stderr,
+                        "Failed to end stream capture (error code %s)!\n",
+                        cudaGetErrorString(cudaErr));
+                        exit(1);
+                    }
+    		cudaErr = cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
+    		if (cudaErr != cudaSuccess) {
+                        fprintf(stderr,
+                        "Failed to instantiate cuda graph (error code %s)!\n",
+                        cudaGetErrorString(cudaErr));
+                        exit(1);
+                    }
+    		graphCreated = true;    
+    	}
 
-        if (i % 100 == 0){
-            // Получение ошибки
-            // кол-во потоков = (size-1)^2
-            get_error_matrix<<<size - 1, size - 1>>>(dev_A, dev_B, dev_err_mat);
-            
-            // Находим максимальную ошибку
-            // Результат в dev_err
-            cub::DeviceReduce::Max(temp_stor, tmp_stor_size, dev_err_mat, dev_err, full_size);
-            
-            // Копирую ошибку с устройства в память хоста
-            cudaMemcpy(&error, dev_err, sizeof(double), cudaMemcpyDeviceToHost);
+    	cudaErr = cudaGraphLaunch(instance, stream);
+    	if (cudaErr != cudaSuccess) {
+                fprintf(stderr,
+                "Failed to launch cuda graph (error code %s)!\n",
+                cudaGetErrorString(cudaErr));
+                exit(1);
+            }
+    	if (cudaErr != cudaSuccess) {
+                fprintf(stderr,
+                "Failed to synchronize the stream (error code %s)!\n",
+                cudaGetErrorString(cudaErr));
+                exit(1);
+            }
 
-        }
+    	// Проверяем ошибку каждые 100 итераций
+    	iter += 100;
 
-        // Смена массивов
-        std::swap(dev_A, dev_B);
+    	// Здесь мы вычисляем абсолютные значения различий массивов,
+        // а затем находим максимальную разницу, т.е. ошибку
+    	subtractArrays<<<grid, block, 0, stream>>>(d_A, d_B, m);
+    	cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, d_B, d_buff, m*m, stream);
+    	cudaErr = cudaMemcpyAsync(h_buff, d_buff, sizeof(double), cudaMemcpyDeviceToHost, stream);
 
+    	if (cudaErr != cudaSuccess) {
+                fprintf(stderr,
+                "Failed to copy error back to host memory(error code %s)!\n",
+                cudaGetErrorString(cudaErr));
+                exit(1);
+            }
+    	err = *h_buff;
+    	flag = err > min_error;
+    }
     }
 
     nvtxRangePop();
 
-    // Вывод массивов
-    // cudaMemcpy(A, dev_A, sizeof(double) * full_size, cudaMemcpyDeviceToHost);
-    
-    // for (int i = 0; i < size; i ++) {
-    //     for (int j = 0; j < size; j ++) {
-    //         std::cout << A[j * size + i] << " ";
-    //     }
-    //     std::cout << std::endl;
-    // }
+    clock_gettime(CLOCK_REALTIME, &stop);
+    delta = (stop.tv_sec - start.tv_sec) + (double)(stop.tv_nsec - start.tv_nsec)/(double)BILLION;
 
-    // Вывод результатов
-    clock_t b = clock();
-    double d = (double)(b-a)/CLOCKS_PER_SEC; // перевожу в секунды 
-    std::cout << "Error: " << error << std::endl;
-    std::cout << "Iteration: " << i << std::endl;
-    std::cout << "Time: " << d << std::endl;
+    printf("Elapsed time %lf\n", delta);
+    printf("Final result: %d, %0.8lf\n", iter, err);
 
-    // Очистка
-    cudaFree(temp_stor);
-    cudaFree(dev_err_mat);
-    cudaFree(dev_A);
-    cudaFree(dev_B);
+    cudaErr = cudaMemcpy(arr, d_A, size, cudaMemcpyDeviceToHost);
     
-    delete[] A;
-    delete[] Anew;
+    if (m == 13) {
+        for (int i = 1; i <= m; i++) {
+            for (int j = 1; j <= m; j++) {
+                printf("%06.3lf ", arr[IDX2F(i,j,m)]);
+            }
+            printf("\n");
+        }
+    }
+        
+    free(arr);
+    free(h_buff);
+
+    cudaFree(d_buff);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_temp_storage);
+
     return 0;
 }
